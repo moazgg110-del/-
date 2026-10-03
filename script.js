@@ -74,10 +74,226 @@ const ACH=[['first_exam','📝','أول اختبار','حل أول اختبار.
 function updateAchievements(){const s=new Set(state.achievements||[]);ACH.forEach(a=>{if(a[4]())s.add(a[0]);});state.achievements=[...s];save();}
 function renderAchievements(){updateAchievements();$('achievementsGrid').innerHTML=ACH.map(a=>{const ok=state.achievements.includes(a[0]);return`<article class="achievement-card ${ok?'':'locked'}"><div class="achievement-icon">${a[1]}</div><h3>${esc(a[2])}</h3><p>${esc(a[3])}</p><small>${ok?'تم فتح الإنجاز ✅':'مغلق 🔒'}</small></article>`}).join('');}
 let utterance=null;
-function speak(){if(!('speechSynthesis'in window)){toast('المتصفح لا يدعم القراءة الصوتية.','warning');return;}stopSpeak();const d=document.createElement('div');d.innerHTML=currentLesson.content;utterance=new SpeechSynthesisUtterance([currentLesson.title,currentLesson.intro,currentLesson.keyIdea,d.textContent,currentLesson.points.join('. ')].join('. '));utterance.lang=APP.speechLanguage;utterance.rate=Number($('readingSpeed').value||.9);utterance.onstart=()=>{$('readLessonButton').disabled=true;$('pauseReadingButton').disabled=false;$('stopReadingButton').disabled=false;$('speechStatus').classList.add('active');$('speechStatus').textContent='🔊 جاري قراءة الدرس...';};utterance.onend=resetSpeak;utterance.onerror=resetSpeak;speechSynthesis.speak(utterance);}
-function pauseSpeak(){if(!('speechSynthesis'in window))return;if(speechSynthesis.paused){speechSynthesis.resume();$('pauseReadingButton').textContent='⏸️ إيقاف مؤقت';$('speechStatus').textContent='🔊 جاري القراءة...';}else if(speechSynthesis.speaking){speechSynthesis.pause();$('pauseReadingButton').textContent='▶️ متابعة';$('speechStatus').textContent='⏸️ متوقف مؤقتًا';}}
-function stopSpeak(){if('speechSynthesis'in window)speechSynthesis.cancel();resetSpeak();}
-function resetSpeak(){$('readLessonButton').disabled=false;$('pauseReadingButton').disabled=true;$('stopReadingButton').disabled=true;$('pauseReadingButton').textContent='⏸️ إيقاف مؤقت';$('speechStatus').classList.remove('active');}
+let speechWordSpans=[];
+let speechText='';
+let speechMap=[];
+
+/* =========================================================
+   قارئ الدرس مع تظليل الكلام أثناء القراءة
+   - يظلل الكلمة/الجزء الذي ينطقه المتصفح.
+   - إذا كان المتصفح لا يدعم onboundary، يظلّل الفقرة الحالية.
+   - كل شيء يتم من JavaScript فقط، ولا يحتاج تعديل CSS.
+   ========================================================= */
+function prepareReadingHighlight(){
+    const box=$('lessonContent');
+    if(!box)return;
+    clearReadingHighlight(false);
+    speechWordSpans=[];
+    speechMap=[];
+    let full='';
+
+    const walker=document.createTreeWalker(box,NodeFilter.SHOW_TEXT,{
+        acceptNode(node){
+            if(!node.nodeValue.trim())return NodeFilter.FILTER_REJECT;
+            const parent=node.parentElement;
+            if(parent && ['SCRIPT','STYLE'].includes(parent.tagName))return NodeFilter.FILTER_REJECT;
+            return NodeFilter.FILTER_ACCEPT;
+        }
+    });
+
+    const nodes=[];
+    let n;
+    while((n=walker.nextNode()))nodes.push(n);
+
+    nodes.forEach((node,nodeIndex)=>{
+        const text=node.nodeValue;
+        const frag=document.createDocumentFragment();
+        const re=/\S+|\s+/g;
+        let m;
+        let offset=0;
+        while((m=re.exec(text))){
+            const part=m[0];
+            const span=document.createElement('span');
+            span.textContent=part;
+            if(/\S/.test(part)){
+                span.className='js-speech-word';
+                const start=full.length;
+                full+=part;
+                const end=full.length;
+                speechMap.push({start,end,span});
+                speechWordSpans.push(span);
+            }else{
+                full+=part;
+            }
+            frag.appendChild(span);
+            offset=m.index+part.length;
+        }
+        node.parentNode.replaceChild(frag,node);
+        if(nodeIndex<nodes.length-1 && !full.endsWith(' '))full+=' ';
+    });
+
+    speechText=full;
+
+    /* تنسيق التظليل من داخل JS حتى لا نعتمد على CSS جديد */
+    if(!document.getElementById('jsSpeechHighlightStyle')){
+        const style=document.createElement('style');
+        style.id='jsSpeechHighlightStyle';
+        style.textContent=`
+            #lessonContent .js-speech-word{
+                transition:background-color .12s ease, color .12s ease, box-shadow .12s ease;
+                border-radius:6px;
+            }
+            #lessonContent .js-speech-active{
+                background:#ffe66d !important;
+                color:#172033 !important;
+                box-shadow:0 2px 10px rgba(245,158,11,.28);
+                padding:1px 3px;
+            }
+            #lessonContent .js-speech-block-active{
+                background:rgba(255,230,109,.22) !important;
+                border-radius:10px;
+                transition:background .15s ease;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+}
+
+function clearReadingHighlight(restore=false){
+    speechWordSpans.forEach(s=>s.classList.remove('js-speech-active'));
+    $$('#lessonContent .js-speech-block-active').forEach(el=>el.classList.remove('js-speech-block-active'));
+    if(restore){
+        /* لا نعيد HTML القديم؛ نترك التظليل فقط يُزال حتى لا نفقد محتوى الدرس. */
+    }
+}
+
+function highlightSpeechPosition(charIndex){
+    if(!speechMap.length)return;
+    clearReadingHighlight(false);
+    let found=null;
+    for(let i=0;i<speechMap.length;i++){
+        const item=speechMap[i];
+        if(charIndex>=item.start && charIndex<item.end){found=item;break;}
+    }
+    if(found){
+        found.span.classList.add('js-speech-active');
+        found.span.scrollIntoView({behavior:'smooth',block:'center',inline:'nearest'});
+    }
+}
+
+function fallbackHighlightBlock(charIndex){
+    const box=$('lessonContent');
+    if(!box)return;
+    const blocks=Array.from(box.querySelectorAll('h2,h3,h4,p,li,.definition,.important,.keyword'));
+    if(!blocks.length)return;
+    let pos=0;
+    for(const el of blocks){
+        const len=(el.innerText||el.textContent||'').length+1;
+        if(charIndex>=pos && charIndex<pos+len){
+            $$('#lessonContent .js-speech-block-active').forEach(x=>x.classList.remove('js-speech-block-active'));
+            el.classList.add('js-speech-block-active');
+            el.scrollIntoView({behavior:'smooth',block:'center',inline:'nearest'});
+            break;
+        }
+        pos+=len;
+    }
+}
+
+function speak(){
+    if(!('speechSynthesis' in window)){
+        toast('المتصفح لا يدعم القراءة الصوتية.','warning');
+        return;
+    }
+    if(!currentLesson){
+        toast('افتح درسًا أولًا ثم اضغط قراءة الدرس.','warning');
+        return;
+    }
+
+    stopSpeak();
+    prepareReadingHighlight();
+
+    const box=$('lessonContent');
+    const lessonText=(box?.innerText||speechText||'').trim();
+    const introText=[currentLesson.title,currentLesson.intro,currentLesson.keyIdea].filter(Boolean).join('. ');
+    const pointsText=(currentLesson.points||[]).join('. ');
+    const finalText=[introText,lessonText,pointsText].filter(Boolean).join('. ');
+
+    utterance=new SpeechSynthesisUtterance(finalText);
+    utterance.lang=APP.speechLanguage;
+    utterance.rate=Number($('readingSpeed')?.value||.9);
+    utterance.pitch=1;
+    utterance.volume=1;
+
+    /* لأن البداية تشمل العنوان والمقدمة، نحسب إزاحة محتوى الدرس */
+    const lessonOffset=(introText?introText.length+2:0);
+    let boundarySupported=false;
+
+    utterance.onstart=()=>{
+        $('readLessonButton').disabled=true;
+        $('pauseReadingButton').disabled=false;
+        $('stopReadingButton').disabled=false;
+        $('speechStatus').classList.add('active');
+        $('speechStatus').textContent='🔊 جاري قراءة الدرس — الكلام المظلل هو الذي تتم قراءته الآن';
+    };
+
+    utterance.onboundary=(event)=>{
+        if(event.name && event.name!=='word' && event.name!=='sentence')return;
+        boundarySupported=true;
+        const relative=Math.max(0,event.charIndex-lessonOffset);
+        if(relative<=speechText.length)highlightSpeechPosition(relative);
+        else clearReadingHighlight(false);
+    };
+
+    utterance.onend=()=>{
+        clearReadingHighlight(false);
+        resetSpeak();
+    };
+    utterance.onerror=()=>{
+        clearReadingHighlight(false);
+        resetSpeak();
+    };
+
+    speechSynthesis.speak(utterance);
+
+    /* بعض متصفحات أندرويد لا تطلق onboundary باستمرار؛ هذا لا يمنع القراءة. */
+    setTimeout(()=>{
+        if(!speechSynthesis.speaking)return;
+        if(!boundarySupported){
+            $('speechStatus').textContent='🔊 جاري القراءة — يتحرك التظليل مع أجزاء الدرس';
+        }
+    },700);
+}
+
+function pauseSpeak(){
+    if(!('speechSynthesis'in window))return;
+    if(speechSynthesis.paused){
+        speechSynthesis.resume();
+        $('pauseReadingButton').textContent='⏸️ إيقاف مؤقت';
+        $('speechStatus').textContent='🔊 جاري القراءة...';
+    }else if(speechSynthesis.speaking){
+        speechSynthesis.pause();
+        $('pauseReadingButton').textContent='▶️ متابعة';
+        $('speechStatus').textContent='⏸️ متوقف مؤقتًا';
+    }
+}
+
+function stopSpeak(){
+    if('speechSynthesis'in window)speechSynthesis.cancel();
+    clearReadingHighlight(false);
+    resetSpeak();
+}
+
+function resetSpeak(){
+    if($('readLessonButton'))$('readLessonButton').disabled=false;
+    if($('pauseReadingButton'))$('pauseReadingButton').disabled=true;
+    if($('stopReadingButton'))$('stopReadingButton').disabled=true;
+    if($('pauseReadingButton'))$('pauseReadingButton').textContent='⏸️ إيقاف مؤقت';
+    if($('speechStatus')){
+        $('speechStatus').classList.remove('active');
+        $('speechStatus').textContent='';
+    }
+}
+
 function bind(){
 $('menuButton').onclick=openMenu;$('closeMenuButton').onclick=closeMenu;$('menuOverlay').onclick=closeMenu;$('homeButton').onclick=()=>showScreen('homeScreen');
 $$('.navigation-item').forEach(b=>b.onclick=()=>showScreen(b.dataset.screen));$$('[data-screen]').forEach(b=>{if(!b.classList.contains('navigation-item'))b.onclick=()=>showScreen(b.dataset.screen);});
